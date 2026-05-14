@@ -170,28 +170,74 @@ class TieredVectorStore:
             c.name
             for c in (await self._cold.get_collections()).collections
         }
-        if self._infra.qdrant_cold_collection not in existing:
-            await self._cold.create_collection(
-                collection_name=self._infra.qdrant_cold_collection,
-                vectors_config=VectorParams(
-                    size=self._schema.encoder_dim,
-                    distance=Distance.COSINE,
-                    on_disk=True,
+        name = self._infra.qdrant_cold_collection
+        if name in existing:
+            mismatches = await self._cold_config_mismatches(name)
+            if mismatches:
+                if self._infra.qdrant_recreate_on_config_mismatch:
+                    await self._cold.delete_collection(collection_name=name)
+                    await self._create_cold_collection()
+                else:
+                    raise RuntimeError(
+                        f"Qdrant collection '{name}' exists with a stale configuration "
+                        f"that diverges from the intended cold-tier schema: {mismatches}. "
+                        "Set InfraConfig.qdrant_recreate_on_config_mismatch=True to drop "
+                        "and recreate it, or delete the on-disk store manually."
+                    )
+        else:
+            await self._create_cold_collection()
+
+    async def _create_cold_collection(self) -> None:
+        await self._cold.create_collection(
+            collection_name=self._infra.qdrant_cold_collection,
+            vectors_config=VectorParams(
+                size=self._schema.encoder_dim,
+                distance=Distance.COSINE,
+                on_disk=True,
+            ),
+            hnsw_config=HnswConfigDiff(
+                m=self._schema.cold_hnsw_m,
+                ef_construct=self._schema.cold_hnsw_ef_construct,
+                on_disk=True,
+            ),
+            optimizers_config=OptimizersConfigDiff(
+                memmap_threshold=self._schema.cold_memmap_threshold,
+            ),
+            quantization_config=ScalarQuantization(
+                scalar=ScalarQuantizationConfig(
+                    type=ScalarType.INT8,
+                    quantile=self._schema.cold_quantile,
+                    always_ram=True,
                 ),
-                hnsw_config=HnswConfigDiff(
-                    m=16,
-                    ef_construct=200,
-                    on_disk=True,
-                ),
-                optimizers_config=OptimizersConfigDiff(memmap_threshold=20_000),
-                quantization_config=ScalarQuantization(
-                    scalar=ScalarQuantizationConfig(
-                        type=ScalarType.INT8,
-                        quantile=0.99,
-                        always_ram=True,
-                    ),
-                ),
-            )
+            ),
+        )
+
+    async def _cold_config_mismatches(self, name: str) -> list[str]:
+        info = await self._cold.get_collection(collection_name=name)
+        cfg = getattr(info, "config", None)
+        problems: list[str] = []
+        hnsw = getattr(cfg, "hnsw_config", None) if cfg else None
+        if hnsw is None:
+            problems.append("hnsw_config is null (expected on-disk HNSW)")
+        else:
+            on_disk = getattr(hnsw, "on_disk", None)
+            if on_disk is False:
+                problems.append("hnsw_config.on_disk=False (expected True)")
+            m = getattr(hnsw, "m", None)
+            if m is not None and m != self._schema.cold_hnsw_m:
+                problems.append(f"hnsw_config.m={m} (expected {self._schema.cold_hnsw_m})")
+        quant = getattr(cfg, "quantization_config", None) if cfg else None
+        if quant is None:
+            problems.append("quantization_config is null (expected INT8 scalar)")
+        params = getattr(cfg, "params", None) if cfg else None
+        vec_params = getattr(params, "vectors", None) if params else None
+        if vec_params is not None:
+            size = getattr(vec_params, "size", None)
+            if size is not None and size != self._schema.encoder_dim:
+                problems.append(
+                    f"vector size={size} (expected {self._schema.encoder_dim})"
+                )
+        return problems
 
     def _hot_ns(self, session_id: str) -> HotTierNamespace:
         if session_id not in self._hot:

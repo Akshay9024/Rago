@@ -87,6 +87,7 @@ class InfraConfig:
     qdrant_cold_collection: str = "cold_corpus"
     qdrant_api_key: Optional[str] = None
     qdrant_local_path: Optional[str] = None
+    qdrant_recreate_on_config_mismatch: bool = False
 
     redis_host: str = "localhost"
     redis_port: int = 6379
@@ -110,7 +111,7 @@ class SystemConfig:
     hardware: HardwareProfile
     deployment: DeploymentMode
     infra: InfraConfig
-    model_dir: str = "/Volumes/Ak_T7/models"
+    model_dir: Optional[str] = None
     log_level: str = "INFO"
 
     @classmethod

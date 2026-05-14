@@ -59,3 +59,16 @@ class RAGSchema:
     cold_search_soft_timeout_ms: int = 50
     cold_search_hnsw_ef: int = 64
     cold_search_hnsw_ef_soft: int = 16
+
+    cold_hnsw_m: int = 16
+    cold_hnsw_ef_construct: int = 200
+    cold_memmap_threshold: int = 20_000
+    cold_quantile: float = 0.99
+
+    rewriter_recent_chars: int = 600
+    rewriter_min_sentence_chars: int = 24
+    rewriter_max_sentences: int = 2
+
+    stop_rag_train_alpha: float = 0.05
+    stop_rag_train_gamma: float = 0.9
+    stop_rag_train_epochs: int = 1

@@ -2,9 +2,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class StopRagTransition:
+    state: "StopRagState"
+    action: "Action"
+    reward: float
+    next_state: Optional["StopRagState"]
 
 
 class Action(IntEnum):
@@ -116,6 +124,42 @@ class StopRagController:
             nri, nei, nci = next_state.index(self._max)
             td_target = reward + gamma * float(np.max(self._q[nri, nei, nci]))
         self._q[ri, ei, ci, action] += alpha * (td_target - self._q[ri, ei, ci, action])
+
+    def train_offline(
+        self,
+        transitions: Iterable[StopRagTransition],
+        alpha: float,
+        gamma: float,
+        epochs: int = 1,
+    ) -> None:
+        batch = list(transitions)
+        if not batch:
+            return
+        for _ in range(max(1, epochs)):
+            for t in batch:
+                self.update(
+                    state=t.state,
+                    action=t.action,
+                    reward=t.reward,
+                    next_state=t.next_state,
+                    alpha=alpha,
+                    gamma=gamma,
+                )
+
+    @classmethod
+    def state_from_trace(
+        cls,
+        retrieval_count: int,
+        mean_entropy: float,
+        context_tokens: int,
+        max_context_tokens: int,
+        max_retrievals: int,
+    ) -> StopRagState:
+        return StopRagState(
+            retrieval_count=min(retrieval_count, max_retrievals - 1),
+            entropy_bucket=cls._entropy_bucket(mean_entropy),
+            coverage_bucket=cls._coverage_bucket(context_tokens, max_context_tokens),
+        )
 
     def save(self, path: str) -> None:
         np.save(path, self._q)

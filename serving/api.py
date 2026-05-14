@@ -1,11 +1,13 @@
 from __future__ import annotations
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from dataclasses import asdict
+from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from config.schema import RAGSchema
@@ -117,6 +119,32 @@ async def query(req: QueryRequest) -> QueryResponse:
         total_latency_ms=resp.total_latency_ms,
         retrieval_latencies_ms=resp.retrieval_latencies_ms,
         trace_id=resp.trace_id,
+    )
+
+
+@app.post("/stream")
+async def stream(req: QueryRequest) -> StreamingResponse:
+    if _pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+
+    rag_req = IterativeRAGRequest(
+        query=req.query,
+        session_id=req.session_id or str(uuid.uuid4()),
+    )
+
+    async def _sse() -> AsyncIterator[bytes]:
+        async for ev in _pipeline.generate_stream(rag_req):
+            payload = json.dumps(asdict(ev), separators=(",", ":"))
+            yield f"event: {ev.kind}\ndata: {payload}\n\n".encode()
+
+    return StreamingResponse(
+        _sse(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 

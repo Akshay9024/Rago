@@ -1,9 +1,10 @@
 from __future__ import annotations
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import AsyncIterator, Literal, Optional
 
 from config.schema import RAGSchema
 from config.settings import SystemConfig
@@ -16,6 +17,9 @@ from orchestration.nats_client import NATSControlPlane, RetrievalRequest
 from retrieval.cache import RedisChunkCache
 from retrieval.embedder import DocumentEmbedder
 from retrieval.vector_store import TieredVectorStore
+
+
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
 
 
 @dataclass
@@ -35,6 +39,22 @@ class IterativeRAGResponse:
     total_latency_ms: float
     retrieval_latencies_ms: list[float]
     trace_id: str
+
+
+@dataclass
+class StreamEvent:
+    kind: Literal["token", "retrieval_start", "retrieval_end", "final"]
+    request_id: str
+    session_id: str
+    trace_id: str
+    delta_text: str = ""
+    retrieval_round: int = 0
+    retrieval_latency_ms: float = 0.0
+    passages_count: int = 0
+    generated_text: str = ""
+    retrieval_count: int = 0
+    total_latency_ms: float = 0.0
+    retrieval_latencies_ms: list[float] = field(default_factory=list)
 
 
 class IterativeRAGPipeline:
@@ -106,7 +126,28 @@ class IterativeRAGPipeline:
             ),
         )
 
-    async def generate(self, request: IterativeRAGRequest) -> IterativeRAGResponse:
+    def _reformulate_query(self, original_query: str, generated_so_far: str) -> str:
+        recent = generated_so_far[-self._schema.rewriter_recent_chars:].strip()
+        if not recent:
+            return original_query
+
+        sentences = [s.strip() for s in _SENTENCE_BOUNDARY.split(recent) if s.strip()]
+        salient = [
+            s for s in sentences if len(s) >= self._schema.rewriter_min_sentence_chars
+        ]
+        tail = salient[-self._schema.rewriter_max_sentences:] if salient else []
+        if not tail:
+            return f"{original_query} {recent}".strip()
+        return f"{original_query} || {' '.join(tail)}".strip()
+
+    def _count_passage_tokens(self, passages: list[str]) -> int:
+        if not passages:
+            return 0
+        return len(self._engine.encode_text(" ".join(passages)))
+
+    async def generate_stream(
+        self, request: IterativeRAGRequest
+    ) -> AsyncIterator[StreamEvent]:
         t_start = time.perf_counter()
 
         initial_passages = await self._initial_retrieval(request.query, request.session_id)
@@ -116,7 +157,7 @@ class IterativeRAGPipeline:
         retrieval_count = 0
         retrieval_latencies: list[float] = []
         entropy_history: list[float] = []
-        context_tokens = sum(len(p.split()) for p in initial_passages)
+        context_tokens = self._count_passage_tokens(initial_passages)
         intrygue_state = IntrygueState()
         seq_id = self._engine.new_request_id()
 
@@ -147,7 +188,16 @@ class IterativeRAGPipeline:
                 async for tok in self._engine.generate_tokens(
                     prompt_token_ids, seq_state
                 ):
-                    accumulated_delta += tok.delta_text
+                    if tok.delta_text:
+                        accumulated_delta += tok.delta_text
+                        yield StreamEvent(
+                            kind="token",
+                            request_id=request.request_id,
+                            session_id=request.session_id,
+                            trace_id=request.trace_id,
+                            delta_text=tok.delta_text,
+                            retrieval_round=retrieval_count,
+                        )
 
                     if tok.is_final:
                         break
@@ -195,8 +245,9 @@ class IterativeRAGPipeline:
                 retrieval_count += 1
                 t_ret = time.perf_counter()
 
-                query_for_retrieval = (
-                    f"{request.query} {accumulated_delta[-300:]}"
+                query_for_retrieval = self._reformulate_query(
+                    original_query=request.query,
+                    generated_so_far=accumulated_delta,
                 )
                 retrieval_req = RetrievalRequest(
                     sequence_id=seq_id,
@@ -207,6 +258,17 @@ class IterativeRAGPipeline:
                     reply_subject=self._control_plane.response_subject,
                 )
 
+                await self._data_plane.expect_context(
+                    sequence_id=seq_id,
+                    retrieval_round=retrieval_count,
+                )
+                yield StreamEvent(
+                    kind="retrieval_start",
+                    request_id=request.request_id,
+                    session_id=request.session_id,
+                    trace_id=request.trace_id,
+                    retrieval_round=retrieval_count,
+                )
                 await self._control_plane.publish_retrieval_request(retrieval_req)
 
                 await self._scheduler.suspend(seq_id)
@@ -226,8 +288,18 @@ class IterativeRAGPipeline:
                 finally:
                     await self._scheduler.resume(seq_id)
 
+                yield StreamEvent(
+                    kind="retrieval_end",
+                    request_id=request.request_id,
+                    session_id=request.session_id,
+                    trace_id=request.trace_id,
+                    retrieval_round=retrieval_count,
+                    retrieval_latency_ms=retrieval_latencies[-1],
+                    passages_count=len(passages),
+                )
+
                 passages_per_round.append(passages)
-                context_tokens += sum(len(p.split()) for p in passages)
+                context_tokens += self._count_passage_tokens(passages)
                 if passages:
                     context_token_ids = context_token_ids + self._engine.encode_text(
                         " ".join(passages)
@@ -240,15 +312,42 @@ class IterativeRAGPipeline:
             await self._scheduler.release(seq_id)
 
         generated_text = "".join(completed_chunks)
-
-        return IterativeRAGResponse(
+        yield StreamEvent(
+            kind="final",
             request_id=request.request_id,
             session_id=request.session_id,
+            trace_id=request.trace_id,
             generated_text=generated_text,
             retrieval_count=retrieval_count,
             total_latency_ms=(time.perf_counter() - t_start) * 1000.0,
             retrieval_latencies_ms=retrieval_latencies,
-            trace_id=request.trace_id,
+        )
+
+    async def generate(self, request: IterativeRAGRequest) -> IterativeRAGResponse:
+        final: Optional[StreamEvent] = None
+        async for ev in self.generate_stream(request):
+            if ev.kind == "final":
+                final = ev
+
+        if final is None:
+            return IterativeRAGResponse(
+                request_id=request.request_id,
+                session_id=request.session_id,
+                generated_text="",
+                retrieval_count=0,
+                total_latency_ms=0.0,
+                retrieval_latencies_ms=[],
+                trace_id=request.trace_id,
+            )
+
+        return IterativeRAGResponse(
+            request_id=final.request_id,
+            session_id=final.session_id,
+            generated_text=final.generated_text,
+            retrieval_count=final.retrieval_count,
+            total_latency_ms=final.total_latency_ms,
+            retrieval_latencies_ms=final.retrieval_latencies_ms,
+            trace_id=final.trace_id,
         )
 
     async def ingest(

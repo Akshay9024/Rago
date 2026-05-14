@@ -86,6 +86,7 @@ class InfraConfig:
     qdrant_grpc_port: int = 6334
     qdrant_cold_collection: str = "cold_corpus"
     qdrant_api_key: Optional[str] = None
+    qdrant_local_path: Optional[str] = None
 
     redis_host: str = "localhost"
     redis_port: int = 6379
@@ -117,7 +118,7 @@ class SystemConfig:
         return cls(
             hardware=RTX4090,
             deployment=DeploymentMode(mode="single_node"),
-            infra=InfraConfig(),
+            infra=InfraConfig(qdrant_local_path="./data/qdrant"),
         )
 
     @classmethod
@@ -125,7 +126,7 @@ class SystemConfig:
         return cls(
             hardware=A6000_48G,
             deployment=DeploymentMode(mode="single_node"),
-            infra=InfraConfig(),
+            infra=InfraConfig(qdrant_local_path="./data/qdrant"),
         )
 
     @classmethod

@@ -154,13 +154,18 @@ class TieredVectorStore:
         self._hot: dict[str, HotTierNamespace] = {}
 
     async def initialize(self) -> None:
-        self._cold = AsyncQdrantClient(
-            host=self._infra.qdrant_host,
-            port=self._infra.qdrant_port,
-            grpc_port=self._infra.qdrant_grpc_port,
-            prefer_grpc=True,
-            api_key=self._infra.qdrant_api_key,
-        )
+        if self._infra.qdrant_local_path:
+            import os
+            os.makedirs(self._infra.qdrant_local_path, exist_ok=True)
+            self._cold = AsyncQdrantClient(path=self._infra.qdrant_local_path)
+        else:
+            self._cold = AsyncQdrantClient(
+                host=self._infra.qdrant_host,
+                port=self._infra.qdrant_port,
+                grpc_port=self._infra.qdrant_grpc_port,
+                prefer_grpc=True,
+                api_key=self._infra.qdrant_api_key,
+            )
         existing = {
             c.name
             for c in (await self._cold.get_collections()).collections

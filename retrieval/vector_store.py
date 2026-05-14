@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -57,7 +58,7 @@ class HotTierNamespace:
         self._chunk_to_label: dict[str, int] = {}
         self._label_to_chunk: dict[int, str] = {}
         self._chunk_to_text: dict[str, str] = {}
-        self._insertion_order: list[int] = []
+        self._insertion_order: deque[int] = deque()
         self._next_label = 0
         self._deleted_pending: int = 0
 
@@ -70,7 +71,7 @@ class HotTierNamespace:
     def _evict_oldest(self, n: int) -> int:
         evicted = 0
         while self._insertion_order and evicted < n:
-            label = self._insertion_order.pop(0)
+            label = self._insertion_order.popleft()
             cid = self._label_to_chunk.pop(label, None)
             if cid is None:
                 continue
@@ -330,7 +331,7 @@ class TieredVectorStore:
             response = await asyncio.wait_for(
                 self._cold.query_points(
                     collection_name=self._infra.qdrant_cold_collection,
-                    query=query,
+                    query=query.tolist(),
                     limit=top_k,
                     search_params=SearchParams(
                         hnsw_ef=hnsw_ef,

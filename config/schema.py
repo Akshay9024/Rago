@@ -34,6 +34,7 @@ class RAGSchema:
     intrygue_window: int = 8
     intrygue_ngram: int = 3
     intrygue_warmup_tokens: int = 4
+    intrygue_suppression_window: int = 32
 
     stop_rag_max_retrievals: int = 8
     stop_rag_lambda: float = 0.1
@@ -46,7 +47,7 @@ class RAGSchema:
     spec_decoding_ngram_min: int = 2
 
     apc_enabled: bool = True
-    gpu_memory_utilization: float = 0.82
+    gpu_memory_utilization: float = 0.90
     max_model_len: int = 32768
     max_context_tokens: int = 8192
 

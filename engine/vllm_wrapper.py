@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
@@ -28,6 +29,7 @@ class SequenceState:
     retrieval_round: int = 0
     token_index: int = 0
     _prev_n_tokens: int = field(default=0, repr=False)
+    _prev_text_len: int = field(default=0, repr=False)
 
 
 @dataclass
@@ -51,10 +53,19 @@ class VLLMWrapper:
             use_fast=True,
         )
 
+    def _resolve_model_path(self) -> str:
+        model_id = self._schema.generative_llm_id
+        model_dir = self._config.model_dir
+        if model_dir:
+            local_path = os.path.join(model_dir, model_id.split("/")[-1])
+            if os.path.isdir(local_path):
+                return local_path
+        return model_id
+
     def _engine_args(self) -> AsyncEngineArgs:
         hw = self._config.hardware
         kwargs: dict = dict(
-            model=self._schema.generative_llm_id,
+            model=self._resolve_model_path(),
             dtype="auto",
             gpu_memory_utilization=self._schema.gpu_memory_utilization,
             tensor_parallel_size=hw.tensor_parallel_size,
@@ -182,9 +193,9 @@ class VLLMWrapper:
                 continue
 
             full_text = comp.text
-            prev_text_len = getattr(state, "_prev_text_len", 0)
+            prev_text_len = state._prev_text_len
             new_text = full_text[prev_text_len:]
-            state._prev_text_len = len(full_text)  # type: ignore[attr-defined]
+            state._prev_text_len = len(full_text)
             state._prev_n_tokens = stop
 
             for offset, i in enumerate(range(start, stop)):

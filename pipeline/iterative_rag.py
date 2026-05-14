@@ -65,7 +65,7 @@ class IterativeRAGPipeline:
         self._subscriber_tasks: list[asyncio.Task] = []
 
     async def _initial_retrieval(self, query: str, session_id: str) -> list[str]:
-        embedding = await asyncio.get_event_loop().run_in_executor(
+        embedding = await asyncio.get_running_loop().run_in_executor(
             None, self._embedder.encode_query, query
         )
         results = await self._vector_store.search(
@@ -81,7 +81,7 @@ class IterativeRAGPipeline:
 
     async def _handle_retrieval_request(self, req: RetrievalRequest) -> None:
         t0 = time.perf_counter()
-        embedding = await asyncio.get_event_loop().run_in_executor(
+        embedding = await asyncio.get_running_loop().run_in_executor(
             None, self._embedder.encode_query, req.query_text
         )
         results = await self._vector_store.search(
@@ -106,10 +106,6 @@ class IterativeRAGPipeline:
             ),
         )
 
-    def _build_context_token_ids(self, passages_per_round: list[list[str]]) -> list[int]:
-        all_text = " ".join(p for passages in passages_per_round for p in passages)
-        return self._engine.encode_text(all_text)
-
     async def generate(self, request: IterativeRAGRequest) -> IterativeRAGResponse:
         t_start = time.perf_counter()
 
@@ -124,6 +120,10 @@ class IterativeRAGPipeline:
         intrygue_state = IntrygueState()
         seq_id = self._engine.new_request_id()
 
+        context_token_ids: list[int] = self._engine.encode_text(
+            " ".join(initial_passages)
+        )
+
         await self._scheduler.acquire(seq_id, SequencePriority.ACTIVE)
         try:
             while True:
@@ -133,16 +133,13 @@ class IterativeRAGPipeline:
                     completed_chunks=completed_chunks,
                 )
 
-                context_token_ids = self._build_context_token_ids(passages_per_round)
-
                 round_req_id = f"{seq_id}:{retrieval_count}"
                 seq_state = SequenceState(
                     request_id=round_req_id,
                     session_id=request.session_id,
                     trace_id=request.trace_id,
-                    context_token_ids=context_token_ids,
+                    context_token_ids=list(context_token_ids),
                 )
-                seq_state._prev_text_len = 0
 
                 retrieval_triggered = False
                 accumulated_delta = ""
@@ -231,6 +228,10 @@ class IterativeRAGPipeline:
 
                 passages_per_round.append(passages)
                 context_tokens += sum(len(p.split()) for p in passages)
+                if passages:
+                    context_token_ids = context_token_ids + self._engine.encode_text(
+                        " ".join(passages)
+                    )
                 intrygue_state = self._intrygue.on_context_injected(
                     current_token_index=seq_state.token_index,
                     state=intrygue_state,
@@ -273,7 +274,7 @@ class IterativeRAGPipeline:
         chunk_ids = [c.chunk_id for c in chunks]
         chunk_sources = [c.source for c in chunks]
 
-        embeddings = await asyncio.get_event_loop().run_in_executor(
+        embeddings = await asyncio.get_running_loop().run_in_executor(
             None, lambda: self._embedder.encode(chunk_texts)
         )
         await self._vector_store.index_documents(
@@ -313,7 +314,7 @@ class IterativeRAGPipeline:
             copy_threshold=schema.intrygue_copy_threshold,
             window=schema.intrygue_window,
             ngram_size=schema.intrygue_ngram,
-            suppression_window=schema.spec_decoding_suppression_window,
+            suppression_window=schema.intrygue_suppression_window,
             warmup_tokens=schema.intrygue_warmup_tokens,
         )
 

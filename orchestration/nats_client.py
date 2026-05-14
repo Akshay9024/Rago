@@ -62,8 +62,7 @@ class _LocalBus:
         self._lock = asyncio.Lock()
 
     async def publish_request(self, req: RetrievalRequest) -> None:
-        loop = asyncio.get_event_loop()
-        now = loop.time()
+        now = asyncio.get_running_loop().time()
         async with self._lock:
             for k, t in list(self._seen.items()):
                 if now - t > self._dedup_window:

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "rago-iterative"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Production-grade Iterative RAG serving system based on RAGO optimization framework"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["config*", "engine*", "retrieval*", "controllers*", "orchestration*", "pipeline*", "serving*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

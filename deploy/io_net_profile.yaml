@@ -1,0 +1,78 @@
+cluster:
+  name: rago-iterative
+  provider: io.net
+  region: auto
+
+node_groups:
+  inference:
+    gpu_type: H100_80G
+    count: 2
+    role: decode_worker
+    tensor_parallel_size: 2
+    env:
+      DEPLOY_PROFILE: h100
+      REMOTE_HOST: "${COORDINATOR_HOST}"
+      NATS_PASSWORD: "${NATS_PASSWORD}"
+
+  retrieval:
+    gpu_type: none
+    cpu_cores: 32
+    memory_gb: 128
+    storage_gb: 2000
+    count: 2
+    role: retrieval_cpu_worker
+    services:
+      - qdrant
+      - redis
+
+  coordinator:
+    gpu_type: none
+    cpu_cores: 8
+    memory_gb: 32
+    count: 1
+    role: coordinator
+    services:
+      - nats
+      - haproxy
+      - ray_head
+
+networking:
+  internal_bandwidth_gbps: 100
+  rdma: true
+  roce_version: 2
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.0
+    ports: [6333, 6334]
+    volumes:
+      - /data/qdrant:/qdrant/storage
+    env:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+  redis:
+    image: redis:7.4-alpine
+    ports: [6379]
+    command: >
+      redis-server
+      --maxmemory 64gb
+      --maxmemory-policy allkeys-lru
+      --save ""
+
+  nats:
+    image: nats:2.10-alpine
+    ports: [4222, 6222, 8222]
+    config: /deploy/nats.conf
+
+ray:
+  head_port: 10001
+  dashboard_port: 8265
+  object_store_memory_gb: 16
+  num_cpus_head: 4
+
+model_cache:
+  path: /data/models
+  models:
+    - id: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+      precision: bfloat16
+    - id: sentence-transformers/all-mpnet-base-v2

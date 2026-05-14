@@ -37,7 +37,7 @@ class SemanticChunker:
 
             if buf and buf_tokens + word_count > self._chunk_size:
                 chunk_text = " ".join(buf)
-                chunk_id = hashlib.sha256(f"{source}:{chunk_text[:64]}".encode()).hexdigest()[:16]
+                chunk_id = hashlib.sha256(f"{source}:{chunk_text}".encode()).hexdigest()[:16]
                 chunks.append(Chunk(
                     text=chunk_text,
                     source=source,
@@ -56,7 +56,7 @@ class SemanticChunker:
 
         if buf:
             chunk_text = " ".join(buf)
-            chunk_id = hashlib.sha256(f"{source}:{chunk_text[:64]}".encode()).hexdigest()[:16]
+            chunk_id = hashlib.sha256(f"{source}:{chunk_text}".encode()).hexdigest()[:16]
             chunks.append(Chunk(
                 text=chunk_text,
                 source=source,

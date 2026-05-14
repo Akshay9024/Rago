@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Callable, Awaitable, Optional
 
 from config.settings import InfraConfig
@@ -20,7 +20,7 @@ class RetrievalRequest:
         return f"{self.sequence_id}:{self.retrieval_round}"
 
     def to_json(self) -> bytes:
-        return json.dumps(self.__dict__).encode()
+        return json.dumps(asdict(self)).encode()
 
     @classmethod
     def from_json(cls, data: bytes) -> "RetrievalRequest":
@@ -35,7 +35,7 @@ class RetrievalResponse:
     latency_ms: float
 
     def to_json(self) -> bytes:
-        return json.dumps(self.__dict__).encode()
+        return json.dumps(asdict(self)).encode()
 
     @classmethod
     def from_json(cls, data: bytes) -> "RetrievalResponse":
@@ -43,15 +43,22 @@ class RetrievalResponse:
 
 
 class _LocalBus:
-    def __init__(self) -> None:
+    def __init__(self, dedup_window_seconds: int) -> None:
         self._queue: asyncio.Queue[RetrievalRequest] = asyncio.Queue()
-        self._seen: set[str] = set()
+        self._seen: dict[str, float] = {}
+        self._dedup_window = float(dedup_window_seconds)
+        self._lock = asyncio.Lock()
 
     async def publish(self, req: RetrievalRequest) -> None:
-        key = req.idempotency_key
-        if key in self._seen:
-            return
-        self._seen.add(key)
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        async with self._lock:
+            for k, t in list(self._seen.items()):
+                if now - t > self._dedup_window:
+                    self._seen.pop(k, None)
+            if req.idempotency_key in self._seen:
+                return
+            self._seen[req.idempotency_key] = now
         await self._queue.put(req)
 
     async def subscribe(
@@ -85,7 +92,7 @@ class _NATSBus:
         )
         self._js = self._nc.jetstream()
         try:
-            await self._js.find_stream(self._infra.nats_stream)
+            await self._js.stream_info(self._infra.nats_stream)
         except Exception:
             await self._js.add_stream(StreamConfig(
                 name=self._infra.nats_stream,
@@ -93,7 +100,7 @@ class _NATSBus:
                     f"{self._infra.nats_stream}.retrieval_request",
                 ],
                 max_msgs=100_000,
-                duplicate_window=self._infra.nats_dedup_window_seconds * 10 ** 9,
+                duplicate_window=self._infra.nats_dedup_window_seconds,
             ))
 
     async def publish(self, req: RetrievalRequest) -> None:
@@ -144,7 +151,7 @@ class NATSControlPlane:
 
     async def initialize(self) -> None:
         if self._use_local:
-            self._bus = _LocalBus()
+            self._bus = _LocalBus(self._infra.nats_dedup_window_seconds)
         else:
             bus = _NATSBus(self._infra)
             await bus.initialize()

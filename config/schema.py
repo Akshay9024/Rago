@@ -40,8 +40,19 @@ class RAGSchema:
     stop_rag_q_table_path: Optional[str] = None
 
     spec_decoding_suppression_window: int = 32
+    spec_decoding_enabled: bool = False
+    spec_decoding_num_tokens: int = 5
+    spec_decoding_ngram_max: int = 4
+    spec_decoding_ngram_min: int = 2
 
     apc_enabled: bool = True
     gpu_memory_utilization: float = 0.82
     max_model_len: int = 32768
     max_context_tokens: int = 8192
+
+    nats_subscriber_concurrency: int = 4
+    retrieval_inflight_timeout_s: float = 30.0
+    cold_search_timeout_ms: int = 100
+    cold_search_soft_timeout_ms: int = 50
+    cold_search_hnsw_ef: int = 64
+    cold_search_hnsw_ef_soft: int = 16

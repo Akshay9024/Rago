@@ -70,6 +70,14 @@ class VLLMWrapper:
             kwargs["load_format"] = "bitsandbytes"
         elif hw.quantization in ("awq", "gptq"):
             kwargs["quantization"] = hw.quantization
+
+        if self._schema.spec_decoding_enabled:
+            kwargs["speculative_config"] = {
+                "method": "ngram",
+                "num_speculative_tokens": self._schema.spec_decoding_num_tokens,
+                "prompt_lookup_max": self._schema.spec_decoding_ngram_max,
+                "prompt_lookup_min": self._schema.spec_decoding_ngram_min,
+            }
         return AsyncEngineArgs(**kwargs)
 
     async def initialize(self) -> None:
@@ -89,29 +97,40 @@ class VLLMWrapper:
     def build_prompt(
         self,
         query: str,
-        initial_context: str,
-        retrieved_rounds: list[list[str]],
-        generated_so_far: str,
+        passages_per_round: list[list[str]],
+        completed_chunks: list[str],
     ) -> str:
-        ctx_block = f"[Initial Context]\n{initial_context}"
-        for ri, passages in enumerate(retrieved_rounds, start=1):
-            joined = "\n".join(f"  [{ri}.{j+1}] {p.strip()}" for j, p in enumerate(passages))
-            ctx_block += f"\n\n[Retrieved Evidence Round {ri}]\n{joined}"
+        if len(passages_per_round) != len(completed_chunks) + 1:
+            raise ValueError(
+                "passages_per_round must have exactly one more entry than completed_chunks: "
+                f"got {len(passages_per_round)} vs {len(completed_chunks)}"
+            )
 
-        user_content = f"{ctx_block}\n\nQuestion: {query}"
+        initial_passages = passages_per_round[0]
+        initial_block = "\n".join(
+            f"  [0.{j+1}] {p.strip()}" for j, p in enumerate(initial_passages)
+        ) or "(no passages retrieved)"
 
-        messages = [
+        messages: list[dict] = [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {
+                "role": "user",
+                "content": f"[Initial Context]\n{initial_block}\n\nQuestion: {query}",
+            },
         ]
 
-        if generated_so_far:
-            messages.append({"role": "assistant", "content": generated_so_far})
-            return self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
+        for i, chunk_text in enumerate(completed_chunks):
+            messages.append({"role": "assistant", "content": chunk_text})
+            new_round_idx = i + 1
+            new_passages = passages_per_round[new_round_idx]
+            evidence_block = "\n".join(
+                f"  [{new_round_idx}.{j+1}] {p.strip()}"
+                for j, p in enumerate(new_passages)
+            ) or "(no new passages retrieved)"
+            messages.append({
+                "role": "user",
+                "content": f"[Retrieved Evidence Round {new_round_idx}]\n{evidence_block}",
+            })
 
         return self._tokenizer.apply_chat_template(
             messages,

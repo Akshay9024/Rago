@@ -62,6 +62,7 @@ class IterativeRAGPipeline:
         self._scheduler = PriorityNonStallScheduler(
             max_concurrent=config.hardware.decode_batch_size
         )
+        self._subscriber_tasks: list[asyncio.Task] = []
 
     async def _initial_retrieval(self, query: str, session_id: str) -> list[str]:
         embedding = await asyncio.get_event_loop().run_in_executor(
@@ -71,10 +72,14 @@ class IterativeRAGPipeline:
             query_embedding=embedding,
             session_id=session_id,
             top_k=self._schema.passages_per_retrieval,
+            cold_timeout_ms=self._schema.cold_search_timeout_ms,
+            cold_soft_timeout_ms=self._schema.cold_search_soft_timeout_ms,
+            ef_full=self._schema.cold_search_hnsw_ef,
+            ef_soft=self._schema.cold_search_hnsw_ef_soft,
         )
         return [r.text for r in results if r.text]
 
-    async def _retrieval_worker(self, req: RetrievalRequest) -> None:
+    async def _handle_retrieval_request(self, req: RetrievalRequest) -> None:
         t0 = time.perf_counter()
         embedding = await asyncio.get_event_loop().run_in_executor(
             None, self._embedder.encode_query, req.query_text
@@ -83,6 +88,10 @@ class IterativeRAGPipeline:
             query_embedding=embedding,
             session_id=req.session_id,
             top_k=self._schema.passages_per_retrieval,
+            cold_timeout_ms=self._schema.cold_search_timeout_ms,
+            cold_soft_timeout_ms=self._schema.cold_search_soft_timeout_ms,
+            ef_full=self._schema.cold_search_hnsw_ef,
+            ef_soft=self._schema.cold_search_hnsw_ef_soft,
         )
         passages = [r.text for r in results if r.text]
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -94,53 +103,62 @@ class IterativeRAGPipeline:
             retrieval_latency_ms=latency_ms,
         ))
 
-    def _build_context_token_ids(self, retrieved_rounds: list[list[str]]) -> list[int]:
-        all_text = " ".join(p for passages in retrieved_rounds for p in passages)
+    def _build_context_token_ids(self, passages_per_round: list[list[str]]) -> list[int]:
+        all_text = " ".join(p for passages in passages_per_round for p in passages)
         return self._engine.encode_text(all_text)
 
     async def generate(self, request: IterativeRAGRequest) -> IterativeRAGResponse:
         t_start = time.perf_counter()
 
         initial_passages = await self._initial_retrieval(request.query, request.session_id)
-        retrieved_rounds: list[list[str]] = [initial_passages]
+        passages_per_round: list[list[str]] = [initial_passages]
+        completed_chunks: list[str] = []
 
-        generated_text = ""
         retrieval_count = 0
         retrieval_latencies: list[float] = []
         entropy_history: list[float] = []
         context_tokens = sum(len(p.split()) for p in initial_passages)
         intrygue_state = IntrygueState()
-        req_id = self._engine.new_request_id()
+        seq_id = self._engine.new_request_id()
 
-        while True:
-            prompt = self._engine.build_prompt(
-                query=request.query,
-                initial_context="\n".join(initial_passages),
-                retrieved_rounds=retrieved_rounds[1:],
-                generated_so_far=generated_text,
-            )
+        await self._scheduler.acquire(seq_id, SequencePriority.ACTIVE)
+        try:
+            while True:
+                prompt = self._engine.build_prompt(
+                    query=request.query,
+                    passages_per_round=passages_per_round,
+                    completed_chunks=completed_chunks,
+                )
 
-            context_token_ids = self._build_context_token_ids(retrieved_rounds)
+                context_token_ids = self._build_context_token_ids(passages_per_round)
 
-            seq_state = SequenceState(
-                request_id=req_id,
-                session_id=request.session_id,
-                trace_id=request.trace_id,
-                context_token_ids=context_token_ids,
-            )
-            seq_state._prev_text_len = 0  # type: ignore[attr-defined]
+                round_req_id = f"{seq_id}:{retrieval_count}"
+                spec_suppressed_until = (
+                    self._schema.spec_decoding_suppression_window
+                    if retrieval_count > 0
+                    else 0
+                )
+                seq_state = SequenceState(
+                    request_id=round_req_id,
+                    session_id=request.session_id,
+                    trace_id=request.trace_id,
+                    context_token_ids=context_token_ids,
+                    spec_suppressed_until=spec_suppressed_until,
+                )
+                seq_state._prev_text_len = 0
 
-            retrieval_triggered = False
-            accumulated_delta = ""
+                retrieval_triggered = False
+                accumulated_delta = ""
 
-            async for tok in self._engine.generate_tokens(prompt, seq_state):
-                accumulated_delta += tok.delta_text
+                async for tok in self._engine.generate_tokens(prompt, seq_state):
+                    accumulated_delta += tok.delta_text
 
-                if tok.is_final:
-                    generated_text += accumulated_delta
-                    break
+                    if tok.is_final:
+                        break
 
-                if tok.logprobs:
+                    if not tok.logprobs:
+                        continue
+
                     e = self._intrygue.compute_entropy(tok.logprobs)
                     entropy_history.append(e)
                     if len(entropy_history) > 64:
@@ -154,62 +172,70 @@ class IterativeRAGPipeline:
                         state=intrygue_state,
                     )
 
-                    if triggered:
-                        mean_entropy = sum(entropy_history) / len(entropy_history)
-                        if self._stop_rag.should_stop(
-                            retrieval_count=retrieval_count,
-                            mean_entropy=mean_entropy,
-                            context_tokens=context_tokens,
-                            max_context_tokens=self._schema.max_context_tokens,
-                        ):
-                            continue
+                    if not triggered:
+                        continue
 
-                        await self._engine.abort(req_id)
-                        generated_text += accumulated_delta
-                        retrieval_triggered = True
-                        break
+                    mean_entropy = sum(entropy_history) / len(entropy_history)
+                    if self._stop_rag.should_stop(
+                        retrieval_count=retrieval_count,
+                        mean_entropy=mean_entropy,
+                        context_tokens=context_tokens,
+                        max_context_tokens=self._schema.max_context_tokens,
+                    ):
+                        continue
 
-            if not retrieval_triggered:
-                break
+                    await self._engine.abort(round_req_id)
+                    retrieval_triggered = True
+                    break
 
-            retrieval_count += 1
-            t_ret = time.perf_counter()
+                completed_chunks.append(accumulated_delta)
 
-            query_for_retrieval = f"{request.query} {generated_text[-300:]}"
-            retrieval_req = RetrievalRequest(
-                sequence_id=req_id,
-                retrieval_round=retrieval_count,
-                query_text=query_for_retrieval,
-                session_id=request.session_id,
-                trace_id=request.trace_id,
-            )
+                if not retrieval_triggered:
+                    break
 
-            asyncio.create_task(
-                self._retrieval_worker(retrieval_req),
-                name=f"ret_{req_id}_{retrieval_count}",
-            )
+                retrieval_count += 1
+                t_ret = time.perf_counter()
 
-            try:
-                ctx = await self._data_plane.wait_for_context(
-                    sequence_id=req_id,
-                    retrieval_round=retrieval_count,
-                    timeout=30.0,
+                query_for_retrieval = (
+                    f"{request.query} {accumulated_delta[-300:]}"
                 )
-                passages = ctx.passages
-                retrieval_latencies.append((time.perf_counter() - t_ret) * 1000.0)
-            except asyncio.TimeoutError:
-                passages = []
-                retrieval_latencies.append(30_000.0)
+                retrieval_req = RetrievalRequest(
+                    sequence_id=seq_id,
+                    retrieval_round=retrieval_count,
+                    query_text=query_for_retrieval,
+                    session_id=request.session_id,
+                    trace_id=request.trace_id,
+                )
 
-            if passages:
-                retrieved_rounds.append(passages)
+                await self._control_plane.publish_retrieval_request(retrieval_req)
+
+                await self._scheduler.suspend(seq_id)
+                try:
+                    ctx = await self._data_plane.wait_for_context(
+                        sequence_id=seq_id,
+                        retrieval_round=retrieval_count,
+                        timeout=self._schema.retrieval_inflight_timeout_s,
+                    )
+                    passages = ctx.passages
+                    retrieval_latencies.append((time.perf_counter() - t_ret) * 1000.0)
+                except asyncio.TimeoutError:
+                    passages = []
+                    retrieval_latencies.append(
+                        self._schema.retrieval_inflight_timeout_s * 1000.0
+                    )
+                finally:
+                    await self._scheduler.resume(seq_id)
+
+                passages_per_round.append(passages)
                 context_tokens += sum(len(p.split()) for p in passages)
                 intrygue_state = self._intrygue.on_context_injected(
                     current_token_index=seq_state.token_index,
                     state=intrygue_state,
                 )
+        finally:
+            await self._scheduler.release(seq_id)
 
-            req_id = self._engine.new_request_id()
+        generated_text = "".join(completed_chunks)
 
         return IterativeRAGResponse(
             request_id=request.request_id,
@@ -256,6 +282,16 @@ class IterativeRAGPipeline:
         )
         return len(chunks)
 
+    async def _start_subscribers(self) -> None:
+        for i in range(self._schema.nats_subscriber_concurrency):
+            t = asyncio.create_task(
+                self._control_plane.subscribe_retrieval_requests(
+                    self._handle_retrieval_request
+                ),
+                name=f"nats_subscriber_{i}",
+            )
+            self._subscriber_tasks.append(t)
+
     @classmethod
     async def create(cls, schema: RAGSchema, config: SystemConfig) -> "IterativeRAGPipeline":
         cache = RedisChunkCache(config.infra)
@@ -290,7 +326,7 @@ class IterativeRAGPipeline:
         data_plane = DataPlane(config.infra, config.deployment)
         await data_plane.initialize()
 
-        return cls(
+        pipeline = cls(
             schema=schema,
             config=config,
             engine=engine,
@@ -301,8 +337,18 @@ class IterativeRAGPipeline:
             control_plane=control_plane,
             data_plane=data_plane,
         )
+        await pipeline._start_subscribers()
+        return pipeline
 
     async def close(self) -> None:
+        for t in self._subscriber_tasks:
+            t.cancel()
+        for t in self._subscriber_tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._subscriber_tasks.clear()
         await self._engine.shutdown()
         await self._vector_store.close()
         await self._control_plane.close()

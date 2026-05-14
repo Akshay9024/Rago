@@ -74,7 +74,7 @@ class DataPlane:
         key = self._key(resp.sequence_id, resp.retrieval_round)
         future: Optional[asyncio.Future[ContextPayload]] = None
         async with self._lock:
-            future = self._pending.pop(key, None)
+            future = self._pending.get(key)
             if future is None or future.done():
                 now = asyncio.get_running_loop().time()
                 self._gc_buffered_locked(now)
@@ -90,21 +90,23 @@ class DataPlane:
         timeout: float = 30.0,
     ) -> ContextPayload:
         key = self._key(sequence_id, retrieval_round)
-        future: asyncio.Future[ContextPayload] = asyncio.get_running_loop().create_future()
 
         async with self._lock:
-            buffered = self._buffered.pop(key, None)
-            if buffered is not None:
-                future.set_result(buffered[0])
-            else:
-                self._pending[key] = future
+            future = self._pending.get(key)
+            if future is None:
+                buffered = self._buffered.pop(key, None)
+                future = asyncio.get_running_loop().create_future()
+                if buffered is not None:
+                    future.set_result(buffered[0])
+                else:
+                    self._pending[key] = future
 
         try:
             return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
-        except asyncio.TimeoutError:
+        finally:
             async with self._lock:
-                self._pending.pop(key, None)
-            raise
+                if self._pending.get(key) is future:
+                    self._pending.pop(key, None)
 
     async def expect_context(
         self,

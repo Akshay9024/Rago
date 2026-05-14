@@ -306,7 +306,7 @@ class IterativeRAGPipeline:
                         " ".join(passages)
                     )
                 intrygue_state = self._intrygue.on_context_injected(
-                    current_token_index=seq_state.token_index,
+                    current_token_index=0,
                     state=intrygue_state,
                 )
         finally:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
-from typing import Optional
 
 from config.settings import InfraConfig, DeploymentMode
 
@@ -16,11 +15,11 @@ class ContextPayload:
 
 class DataPlane:
     """
-    Context delivery plane: bridges the retrieval worker and the decode worker.
+    Context delivery plane bridging the retrieval worker and the decode worker.
 
-    Single-node mode uses asyncio Futures for zero-copy local delivery.
-    Multi-node mode (future) would replace this with a gRPC streaming channel
-    that transfers token IDs directly to the target GPU memory address.
+    Keyed by (sequence_id, retrieval_round) to guarantee idempotency: a stale
+    or duplicate delivery from a prior round cannot resume the wrong generation
+    step, even if NATS at-least-once redelivers after a worker restart.
     """
 
     def __init__(self, infra: InfraConfig, deployment: DeploymentMode):
@@ -29,30 +28,37 @@ class DataPlane:
         self._pending: dict[str, asyncio.Future[ContextPayload]] = {}
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _key(sequence_id: str, retrieval_round: int) -> str:
+        return f"{sequence_id}:{retrieval_round}"
+
     async def initialize(self) -> None:
         pass
 
     async def wait_for_context(
         self,
         sequence_id: str,
+        retrieval_round: int,
         timeout: float = 30.0,
     ) -> ContextPayload:
+        key = self._key(sequence_id, retrieval_round)
         loop = asyncio.get_event_loop()
         future: asyncio.Future[ContextPayload] = loop.create_future()
 
         async with self._lock:
-            self._pending[sequence_id] = future
+            self._pending[key] = future
 
         try:
             return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
         except asyncio.TimeoutError:
             async with self._lock:
-                self._pending.pop(sequence_id, None)
+                self._pending.pop(key, None)
             raise
 
     async def deliver_context(self, payload: ContextPayload) -> None:
+        key = self._key(payload.sequence_id, payload.retrieval_round)
         async with self._lock:
-            future = self._pending.pop(payload.sequence_id, None)
+            future = self._pending.pop(key, None)
         if future and not future.done():
             future.set_result(payload)
 

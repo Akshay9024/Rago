@@ -14,6 +14,7 @@ from qdrant_client.http.models import (
     PointStruct,
     SearchParams,
     VectorParams,
+    ScoredPoint,
 )
 
 from config.schema import RAGSchema
@@ -171,11 +172,14 @@ class TieredVectorStore:
             cached = await self._cache.get(r.chunk_id)
             if cached:
                 r.text = cached["text"]
+                chunk_emb = np.array(cached["embedding"], dtype=np.float32).reshape(1, -1)
+            else:
+                chunk_emb = None
             novel_cold.append(r)
-            if r.text:
+            if r.text and chunk_emb is not None:
                 ns.add(
                     chunk_ids=[r.chunk_id],
-                    embeddings=query_embedding.reshape(1, -1),
+                    embeddings=chunk_emb,
                     texts=[r.text],
                 )
 
@@ -190,24 +194,25 @@ class TieredVectorStore:
         timeout_ms: int,
     ) -> list[RetrievalResult]:
         try:
-            hits = await asyncio.wait_for(
-                self._cold.search(
+            response = await asyncio.wait_for(
+                self._cold.query_points(
                     collection_name=self._infra.qdrant_cold_collection,
-                    query_vector=query.tolist(),
+                    query=query,
                     limit=top_k,
                     search_params=SearchParams(hnsw_ef=64, exact=False),
                     with_payload=True,
+                    with_vectors=False,
                 ),
                 timeout=timeout_ms / 1000.0,
             )
             return [
                 RetrievalResult(
-                    chunk_id=h.payload.get("chunk_id", str(h.id)),
-                    text=h.payload.get("text", ""),
-                    score=float(h.score),
+                    chunk_id=p.payload.get("chunk_id", str(p.id)),
+                    text=p.payload.get("text", ""),
+                    score=float(p.score),
                     source="cold_tier",
                 )
-                for h in hits
+                for p in response.points
             ]
         except asyncio.TimeoutError:
             return []

@@ -38,19 +38,6 @@ class IterativeRAGResponse:
 
 
 class IterativeRAGPipeline:
-    """
-    Production-grade iterative RAG serving pipeline.
-
-    Implements RAGO's non-stall execution graph for iterative Paradigm III:
-      1. Initial retrieval → prefill → decode
-      2. INTRYGUE monitors token entropy and copy score per-step
-      3. On trigger: abort decode, async retrieval (GPU not stalled — scheduler
-         fills the freed batch slot with other ready sequences)
-      4. Retrieved context is tail-appended (APC cache-hits on prefix)
-      5. Stop-RAG MDP governs whether another retrieval is worth the latency cost
-      6. EAGLE-3 spec-decoding is suppressed for N tokens after each injection
-    """
-
     def __init__(
         self,
         schema: RAGSchema,
@@ -76,11 +63,7 @@ class IterativeRAGPipeline:
             max_concurrent=config.hardware.decode_batch_size
         )
 
-    async def _initial_retrieval(
-        self,
-        query: str,
-        session_id: str,
-    ) -> list[str]:
+    async def _initial_retrieval(self, query: str, session_id: str) -> list[str]:
         embedding = await asyncio.get_event_loop().run_in_executor(
             None, self._embedder.encode_query, query
         )
@@ -91,10 +74,7 @@ class IterativeRAGPipeline:
         )
         return [r.text for r in results if r.text]
 
-    async def _retrieval_worker(
-        self,
-        req: RetrievalRequest,
-    ) -> None:
+    async def _retrieval_worker(self, req: RetrievalRequest) -> None:
         t0 = time.perf_counter()
         embedding = await asyncio.get_event_loop().run_in_executor(
             None, self._embedder.encode_query, req.query_text
@@ -114,19 +94,21 @@ class IterativeRAGPipeline:
             retrieval_latency_ms=latency_ms,
         ))
 
+    def _build_context_token_ids(self, retrieved_rounds: list[list[str]]) -> list[int]:
+        all_text = " ".join(p for passages in retrieved_rounds for p in passages)
+        return self._engine.encode_text(all_text)
+
     async def generate(self, request: IterativeRAGRequest) -> IterativeRAGResponse:
         t_start = time.perf_counter()
 
         initial_passages = await self._initial_retrieval(request.query, request.session_id)
-
         retrieved_rounds: list[list[str]] = [initial_passages]
+
         generated_text = ""
         retrieval_count = 0
         retrieval_latencies: list[float] = []
-
         entropy_history: list[float] = []
-        context_tokens = len(" ".join(initial_passages).split())
-
+        context_tokens = sum(len(p.split()) for p in initial_passages)
         intrygue_state = IntrygueState()
         req_id = self._engine.new_request_id()
 
@@ -138,21 +120,25 @@ class IterativeRAGPipeline:
                 generated_so_far=generated_text,
             )
 
+            context_token_ids = self._build_context_token_ids(retrieved_rounds)
+
             seq_state = SequenceState(
                 request_id=req_id,
                 session_id=request.session_id,
                 trace_id=request.trace_id,
+                context_token_ids=context_token_ids,
             )
+            seq_state._prev_text_len = 0  # type: ignore[attr-defined]
 
             retrieval_triggered = False
-            partial_delta = ""
+            accumulated_delta = ""
 
             async for tok in self._engine.generate_tokens(prompt, seq_state):
-                if tok.is_final:
-                    generated_text += tok.delta_text
-                    break
+                accumulated_delta += tok.delta_text
 
-                partial_delta += tok.delta_text
+                if tok.is_final:
+                    generated_text += accumulated_delta
+                    break
 
                 if tok.logprobs:
                     e = self._intrygue.compute_entropy(tok.logprobs)
@@ -179,7 +165,7 @@ class IterativeRAGPipeline:
                             continue
 
                         await self._engine.abort(req_id)
-                        generated_text += partial_delta
+                        generated_text += accumulated_delta
                         retrieval_triggered = True
                         break
 
@@ -198,20 +184,20 @@ class IterativeRAGPipeline:
                 trace_id=request.trace_id,
             )
 
-            retrieval_task = asyncio.create_task(
+            asyncio.create_task(
                 self._retrieval_worker(retrieval_req),
-                name=f"retrieval_{req_id}_{retrieval_count}",
+                name=f"ret_{req_id}_{retrieval_count}",
             )
 
             try:
                 ctx = await self._data_plane.wait_for_context(
                     sequence_id=req_id,
+                    retrieval_round=retrieval_count,
                     timeout=30.0,
                 )
                 passages = ctx.passages
                 retrieval_latencies.append((time.perf_counter() - t_ret) * 1000.0)
             except asyncio.TimeoutError:
-                await retrieval_task
                 passages = []
                 retrieval_latencies.append(30_000.0)
 
@@ -271,15 +257,10 @@ class IterativeRAGPipeline:
         return len(chunks)
 
     @classmethod
-    async def create(
-        cls,
-        schema: RAGSchema,
-        config: SystemConfig,
-    ) -> "IterativeRAGPipeline":
+    async def create(cls, schema: RAGSchema, config: SystemConfig) -> "IterativeRAGPipeline":
         cache = RedisChunkCache(config.infra)
         await cache.initialize()
 
-        embedder_device = "cuda" if config.hardware.tensor_parallel_size >= 1 else "cpu"
         embedder = DocumentEmbedder(schema, device="cpu")
 
         vector_store = TieredVectorStore(schema, config.infra, cache)

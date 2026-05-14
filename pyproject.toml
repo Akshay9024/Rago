@@ -12,6 +12,3 @@ description = "Production-grade Iterative RAG serving system based on RAGO optim
 where = ["."]
 include = ["config*", "engine*", "retrieval*", "controllers*", "orchestration*", "pipeline*", "serving*"]
 
-[tool.ruff]
-line-length = 100
-target-version = "py311"

@@ -42,6 +42,6 @@ class RAGSchema:
     spec_decoding_suppression_window: int = 32
 
     apc_enabled: bool = True
-    gpu_memory_utilization: float = 0.90
+    gpu_memory_utilization: float = 0.82
     max_model_len: int = 32768
     max_context_tokens: int = 8192

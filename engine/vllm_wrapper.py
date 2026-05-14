@@ -1,15 +1,21 @@
 from __future__ import annotations
-import asyncio
 import uuid
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
+from transformers import AutoTokenizer
 from vllm import AsyncEngineArgs, SamplingParams
 from vllm.engine.async_llm_engine import AsyncLLMEngine
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import CompletionOutput
 
 from config.schema import RAGSchema
 from config.settings import SystemConfig
+
+_SYSTEM_PROMPT = (
+    "You are a precise multi-hop reasoning assistant. "
+    "Use only the provided evidence to answer. "
+    "Think through each step carefully before writing your final answer."
+)
 
 
 @dataclass
@@ -22,7 +28,7 @@ class SequenceState:
     retrieval_round: int = 0
     token_index: int = 0
     spec_suppressed_until: int = 0
-    _prev_text_len: int = field(default=0, repr=False)
+    _prev_n_tokens: int = field(default=0, repr=False)
 
 
 @dataclass
@@ -35,16 +41,15 @@ class TokenOutput:
 
 
 class VLLMWrapper:
-    _SYSTEM_PROMPT = (
-        "You are a precise multi-hop reasoning assistant. "
-        "Use only the provided evidence. "
-        "Think step by step before answering."
-    )
-
     def __init__(self, schema: RAGSchema, config: SystemConfig):
         self._schema = schema
         self._config = config
         self._engine: Optional[AsyncLLMEngine] = None
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            schema.generative_llm_id,
+            trust_remote_code=True,
+            use_fast=True,
+        )
 
     def _engine_args(self) -> AsyncEngineArgs:
         hw = self._config.hardware
@@ -78,6 +83,9 @@ class VLLMWrapper:
             skip_special_tokens=True,
         )
 
+    def encode_text(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text, add_special_tokens=False)
+
     def build_prompt(
         self,
         query: str,
@@ -86,29 +94,30 @@ class VLLMWrapper:
         generated_so_far: str,
     ) -> str:
         ctx_block = f"[Initial Context]\n{initial_context}"
-
         for ri, passages in enumerate(retrieved_rounds, start=1):
-            block = "\n".join(
-                f"  [{ri}.{j+1}] {p.strip()}"
-                for j, p in enumerate(passages)
-            )
-            ctx_block += f"\n\n[Retrieved Evidence Round {ri}]\n{block}"
+            joined = "\n".join(f"  [{ri}.{j+1}] {p.strip()}" for j, p in enumerate(passages))
+            ctx_block += f"\n\n[Retrieved Evidence Round {ri}]\n{joined}"
 
-        prompt = (
-            f"<|begin_of_text|>"
-            f"<|start_header_id|>system<|end_header_id|>\n"
-            f"{self._SYSTEM_PROMPT}\n"
-            f"<|eot_id|>"
-            f"<|start_header_id|>user<|end_header_id|>\n"
-            f"{ctx_block}\n\n"
-            f"Question: {query}\n"
-            f"<|eot_id|>"
-            f"<|start_header_id|>assistant<|end_header_id|>\n"
-        )
+        user_content = f"{ctx_block}\n\nQuestion: {query}"
+
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
         if generated_so_far:
-            prompt += generated_so_far
+            messages.append({"role": "assistant", "content": generated_so_far})
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
 
-        return prompt
+        return self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
     async def generate_tokens(
         self,
@@ -116,7 +125,7 @@ class VLLMWrapper:
         state: SequenceState,
     ) -> AsyncIterator[TokenOutput]:
         params = self._sampling_params()
-        state._prev_text_len = 0
+        state._prev_n_tokens = 0
         state.generated_token_ids.clear()
 
         async for output in self._engine.generate(
@@ -130,24 +139,25 @@ class VLLMWrapper:
             if not comp.token_ids:
                 continue
 
-            n_prev = state._prev_text_len
-            full_text = comp.text
-            delta = full_text[n_prev:]
-            state._prev_text_len = len(full_text)
-
-            n_new_tokens = len(comp.token_ids) - len(state.generated_token_ids)
-            if n_new_tokens <= 0:
+            n_new = len(comp.token_ids) - state._prev_n_tokens
+            if n_new <= 0:
                 continue
 
             new_token_id = comp.token_ids[-1]
             state.generated_token_ids.append(new_token_id)
             state.token_index += 1
 
+            full_text = comp.text
+            prev_len = getattr(state, "_prev_text_len", 0)
+            delta = full_text[prev_len:]
+            state._prev_text_len = len(full_text)  # type: ignore[attr-defined]
+            state._prev_n_tokens = len(comp.token_ids)
+
             logprobs: dict[int, float] = {}
             if comp.logprobs and len(comp.logprobs) >= len(comp.token_ids):
-                lp_entry = comp.logprobs[len(comp.token_ids) - 1]
-                if lp_entry:
-                    logprobs = {tid: lp.logprob for tid, lp in lp_entry.items()}
+                entry = comp.logprobs[len(comp.token_ids) - 1]
+                if entry:
+                    logprobs = {tid: lp.logprob for tid, lp in entry.items()}
 
             yield TokenOutput(
                 token_id=new_token_id,

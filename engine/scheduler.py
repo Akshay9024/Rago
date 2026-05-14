@@ -57,13 +57,16 @@ class PriorityNonStallScheduler:
 
     async def suspend(self, seq_id: str) -> None:
         async with self._lock:
-            if seq_id in self._active:
-                task = self._active.pop(seq_id)
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            task = self._active.pop(seq_id, None)
+
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        async with self._lock:
             await self._drain()
 
     async def resume(

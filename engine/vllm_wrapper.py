@@ -7,6 +7,7 @@ from typing import AsyncIterator, Optional
 from transformers import AutoTokenizer
 from vllm import AsyncEngineArgs, SamplingParams
 from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.logprobs import FlatLogprobs
 from vllm.outputs import CompletionOutput
 
 from config.schema import RAGSchema
@@ -42,6 +43,29 @@ class TokenOutput:
     request_id: str
 
 
+def _logprobs_at(sample_logprobs, i: int) -> dict[int, float]:
+    if not sample_logprobs:
+        return {}
+    if isinstance(sample_logprobs, FlatLogprobs):
+        if i >= len(sample_logprobs.start_indices):
+            return {}
+        s = sample_logprobs.start_indices[i]
+        e = sample_logprobs.end_indices[i]
+        return {
+            tid: lp
+            for tid, lp in zip(
+                sample_logprobs.token_ids[s:e],
+                sample_logprobs.logprobs[s:e],
+            )
+        }
+    if i >= len(sample_logprobs):
+        return {}
+    entry = sample_logprobs[i]
+    if not entry:
+        return {}
+    return {t: lp.logprob for t, lp in entry.items()}
+
+
 class VLLMWrapper:
     def __init__(self, schema: RAGSchema, config: SystemConfig):
         self._schema = schema
@@ -72,9 +96,10 @@ class VLLMWrapper:
             enable_prefix_caching=self._schema.apc_enabled,
             max_model_len=self._schema.max_model_len,
             trust_remote_code=True,
-            disable_log_requests=True,
+            enable_log_requests=False,
             max_num_batched_tokens=self._schema.max_model_len,
             max_num_seqs=hw.decode_batch_size,
+            max_logprobs=self._schema.logprobs_k,
         )
         if hw.quantization == "bitsandbytes":
             kwargs["quantization"] = "bitsandbytes"
@@ -98,7 +123,7 @@ class VLLMWrapper:
         return SamplingParams(
             temperature=0.0,
             max_tokens=self._schema.decode_length,
-            logprobs=32,
+            logprobs=self._schema.logprobs_k,
             skip_special_tokens=True,
         )
 
@@ -198,16 +223,10 @@ class VLLMWrapper:
             state._prev_text_len = len(full_text)
             state._prev_n_tokens = stop
 
-            for offset, i in enumerate(range(start, stop)):
+            for i in range(start, stop):
                 tid = comp.token_ids[i]
                 state.generated_token_ids.append(tid)
                 state.token_index += 1
-
-                logprobs: dict[int, float] = {}
-                if comp.logprobs and len(comp.logprobs) > i:
-                    entry = comp.logprobs[i]
-                    if entry:
-                        logprobs = {t: lp.logprob for t, lp in entry.items()}
 
                 is_last_in_batch = (i == stop - 1)
                 delta_text = new_text if is_last_in_batch else ""
@@ -216,7 +235,7 @@ class VLLMWrapper:
                 yield TokenOutput(
                     token_id=tid,
                     delta_text=delta_text,
-                    logprobs=logprobs,
+                    logprobs=_logprobs_at(comp.logprobs, i),
                     is_final=is_final,
                     is_last_in_batch=is_last_in_batch,
                     request_id=state.request_id,

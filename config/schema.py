@@ -46,6 +46,8 @@ class RAGSchema:
     spec_decoding_ngram_max: int = 4
     spec_decoding_ngram_min: int = 2
 
+    logprobs_k: int = 32
+
     apc_enabled: bool = True
     gpu_memory_utilization: float = 0.90
     max_model_len: int = 32768

@@ -73,8 +73,7 @@ class DataPlane:
         timeout: float = 30.0,
     ) -> ContextPayload:
         key = self._key(sequence_id, retrieval_round)
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future[ContextPayload] = loop.create_future()
+        future: asyncio.Future[ContextPayload] = asyncio.get_running_loop().create_future()
 
         async with self._lock:
             self._pending[key] = future

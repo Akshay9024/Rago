@@ -35,6 +35,18 @@ class RAGSchema:
     intrygue_ngram: int = 3
     intrygue_warmup_tokens: int = 4
     intrygue_suppression_window: int = 32
+    intrygue_text_trigger_enabled: bool = True
+    intrygue_text_trigger_window_chars: int = 240
+    intrygue_text_trigger_phrases: tuple[str, ...] = (
+        r"i\s+don'?t\s+(know|have|recall|remember|see)",
+        r"i'?m\s+not\s+sure",
+        r"i\s+am\s+not\s+sure",
+        r"context\s+(doesn'?t|does\s+not)\s+(mention|specify|state|provide|say|include)",
+        r"(isn'?t|not)\s+(mentioned|specified|stated|provided)\s+in\s+the\s+context",
+        r"(no\s+information|no\s+mention)\s+(about|on|of)",
+        r"i\s+might\s+(need|have)\s+to\s+(infer|recall|look|search|find|check|guess)",
+        r"unclear\s+from\s+the\s+context",
+    )
 
     stop_rag_max_retrievals: int = 8
     stop_rag_lambda: float = 0.1

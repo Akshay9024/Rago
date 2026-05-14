@@ -219,6 +219,7 @@ class IterativeRAGPipeline:
                         context_ids=seq_state.context_token_ids,
                         current_token_index=seq_state.token_index,
                         state=intrygue_state,
+                        recent_text=accumulated_delta,
                     )
 
                     if not triggered:
@@ -415,6 +416,9 @@ class IterativeRAGPipeline:
             ngram_size=schema.intrygue_ngram,
             suppression_window=schema.intrygue_suppression_window,
             warmup_tokens=schema.intrygue_warmup_tokens,
+            text_trigger_enabled=schema.intrygue_text_trigger_enabled,
+            text_trigger_phrases=schema.intrygue_text_trigger_phrases,
+            text_trigger_window_chars=schema.intrygue_text_trigger_window_chars,
         )
 
         stop_rag = StopRagController(

@@ -1,6 +1,8 @@
 from __future__ import annotations
+import re
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Iterable, Pattern
 
 import numpy as np
 
@@ -33,6 +35,9 @@ class IntrygueController:
         ngram_size: int = 3,
         suppression_window: int = 32,
         warmup_tokens: int = 4,
+        text_trigger_enabled: bool = False,
+        text_trigger_phrases: Iterable[str] = (),
+        text_trigger_window_chars: int = 240,
     ):
         self._e_thresh = entropy_threshold
         self._c_thresh = copy_threshold
@@ -40,6 +45,11 @@ class IntrygueController:
         self._ngram = ngram_size
         self._sup_window = suppression_window
         self._warmup = warmup_tokens
+        self._text_enabled = bool(text_trigger_enabled)
+        self._text_window_chars = max(0, int(text_trigger_window_chars))
+        self._text_patterns: list[Pattern[str]] = [
+            re.compile(p, re.IGNORECASE) for p in (text_trigger_phrases or ())
+        ]
 
     def compute_entropy(self, logprobs: dict[int, float]) -> float:
         if not logprobs:
@@ -70,6 +80,12 @@ class IntrygueController:
         )
         return matches / possible
 
+    def _text_trigger_active(self, recent_text: str) -> bool:
+        if not self._text_enabled or not self._text_patterns or not recent_text:
+            return False
+        window = recent_text[-self._text_window_chars:] if self._text_window_chars else recent_text
+        return any(p.search(window) for p in self._text_patterns)
+
     def should_retrieve(
         self,
         logprobs: dict[int, float],
@@ -77,6 +93,7 @@ class IntrygueController:
         context_ids: list[int],
         current_token_index: int,
         state: IntrygueState,
+        recent_text: str = "",
     ) -> tuple[bool, IntrygueState]:
         if current_token_index < state.suppressed_until_token:
             return False, state
@@ -90,7 +107,11 @@ class IntrygueController:
         avg_entropy = float(np.mean(state.entropy_history))
         copy_score = self.compute_copy_score(generated_ids, context_ids)
 
-        triggered = avg_entropy > self._e_thresh and copy_score < self._c_thresh
+        entropy_trigger = avg_entropy > self._e_thresh and copy_score < self._c_thresh
+        text_trigger = (
+            self._text_trigger_active(recent_text) and copy_score < self._c_thresh
+        )
+        triggered = entropy_trigger or text_trigger
 
         if triggered:
             new_state = IntrygueState(

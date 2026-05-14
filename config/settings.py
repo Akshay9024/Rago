@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 @dataclass
 class HardwareProfile:
-    gpu_type: Literal["rtx4090", "a100_40g", "a100_80g", "h100_80g"]
+    gpu_type: Literal["rtx4090", "a6000_48g", "a100_40g", "a100_80g", "h100_80g"]
     vram_gb: int
     precision: Literal["int8", "bfloat16", "float16", "fp8"]
     quantization: Optional[Literal["bitsandbytes", "awq", "gptq"]]
@@ -25,6 +25,17 @@ RTX4090 = HardwareProfile(
     max_batch_size=16,
     decode_batch_size=32,
     retrieval_batch_size=4,
+)
+
+A6000_48G = HardwareProfile(
+    gpu_type="a6000_48g",
+    vram_gb=48,
+    precision="bfloat16",
+    quantization=None,
+    tensor_parallel_size=1,
+    max_batch_size=48,
+    decode_batch_size=96,
+    retrieval_batch_size=12,
 )
 
 A100_40G = HardwareProfile(
@@ -107,6 +118,27 @@ class SystemConfig:
             hardware=RTX4090,
             deployment=DeploymentMode(mode="single_node"),
             infra=InfraConfig(),
+        )
+
+    @classmethod
+    def for_a6000_local(cls) -> "SystemConfig":
+        return cls(
+            hardware=A6000_48G,
+            deployment=DeploymentMode(mode="single_node"),
+            infra=InfraConfig(),
+        )
+
+    @classmethod
+    def for_a6000_ssh(cls, host: str) -> "SystemConfig":
+        return cls(
+            hardware=A6000_48G,
+            deployment=DeploymentMode(mode="single_node"),
+            infra=InfraConfig(
+                qdrant_host=host,
+                redis_host=host,
+                nats_url=f"nats://{host}:4222",
+                grpc_host=host,
+            ),
         )
 
     @classmethod

@@ -52,6 +52,11 @@ def _build_config() -> tuple[RAGSchema, SystemConfig]:
 
     if profile == "rtx4090_local":
         cfg = SystemConfig.for_rtx4090_local()
+    elif profile == "a6000_local":
+        cfg = SystemConfig.for_a6000_local()
+    elif profile == "a6000":
+        host = os.environ["REMOTE_HOST"]
+        cfg = SystemConfig.for_a6000_ssh(host)
     elif profile == "a100":
         host = os.environ["REMOTE_HOST"]
         cfg = SystemConfig.for_a100_ssh(host)

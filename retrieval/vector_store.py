@@ -51,6 +51,7 @@ class HotTierNamespace:
             max_elements=self._max_vectors,
             ef_construction=200,
             M=16,
+            allow_replace_deleted=True,
         )
         self._index.set_ef(50)
         self._chunk_to_label: dict[str, int] = {}
@@ -58,6 +59,7 @@ class HotTierNamespace:
         self._chunk_to_text: dict[str, str] = {}
         self._insertion_order: list[int] = []
         self._next_label = 0
+        self._deleted_pending: int = 0
 
     def __len__(self) -> int:
         return len(self._chunk_to_label)
@@ -65,7 +67,7 @@ class HotTierNamespace:
     def contains(self, chunk_id: str) -> bool:
         return chunk_id in self._chunk_to_label
 
-    def _evict_oldest(self, n: int) -> None:
+    def _evict_oldest(self, n: int) -> int:
         evicted = 0
         while self._insertion_order and evicted < n:
             label = self._insertion_order.pop(0)
@@ -77,8 +79,10 @@ class HotTierNamespace:
             try:
                 self._index.mark_deleted(label)
             except RuntimeError:
-                pass
+                continue
             evicted += 1
+            self._deleted_pending += 1
+        return evicted
 
     def add(
         self,
@@ -109,7 +113,10 @@ class HotTierNamespace:
             self._next_label += 1
 
         arr = np.asarray(novel_vecs, dtype=np.float32)
-        self._index.add_items(arr, labels)
+        use_replace = self._deleted_pending > 0
+        self._index.add_items(arr, labels, replace_deleted=use_replace)
+        if use_replace:
+            self._deleted_pending = max(0, self._deleted_pending - len(labels))
 
         for label, cid, text in zip(labels, novel_ids, novel_texts):
             self._chunk_to_label[cid] = label

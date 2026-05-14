@@ -27,7 +27,6 @@ class SequenceState:
     context_token_ids: list[int] = field(default_factory=list)
     retrieval_round: int = 0
     token_index: int = 0
-    spec_suppressed_until: int = 0
     _prev_n_tokens: int = field(default=0, repr=False)
 
 
@@ -37,6 +36,7 @@ class TokenOutput:
     delta_text: str
     logprobs: dict[int, float]
     is_final: bool
+    is_last_in_batch: bool
     request_id: str
 
 
@@ -94,6 +94,19 @@ class VLLMWrapper:
     def encode_text(self, text: str) -> list[int]:
         return self._tokenizer.encode(text, add_special_tokens=False)
 
+    def build_prompt_token_ids(
+        self,
+        query: str,
+        passages_per_round: list[list[str]],
+        completed_chunks: list[str],
+    ) -> list[int]:
+        prompt = self.build_prompt(
+            query=query,
+            passages_per_round=passages_per_round,
+            completed_chunks=completed_chunks,
+        )
+        return self._tokenizer.encode(prompt, add_special_tokens=False)
+
     def build_prompt(
         self,
         query: str,
@@ -140,15 +153,20 @@ class VLLMWrapper:
 
     async def generate_tokens(
         self,
-        prompt: str,
+        prompt,
         state: SequenceState,
     ) -> AsyncIterator[TokenOutput]:
         params = self._sampling_params()
         state._prev_n_tokens = 0
         state.generated_token_ids.clear()
 
+        if isinstance(prompt, list):
+            engine_prompt = {"prompt_token_ids": prompt}
+        else:
+            engine_prompt = prompt
+
         async for output in self._engine.generate(
-            prompt=prompt,
+            prompt=engine_prompt,
             sampling_params=params,
             request_id=state.request_id,
         ):
@@ -158,33 +176,40 @@ class VLLMWrapper:
             if not comp.token_ids:
                 continue
 
-            n_new = len(comp.token_ids) - state._prev_n_tokens
-            if n_new <= 0:
+            start = state._prev_n_tokens
+            stop = len(comp.token_ids)
+            if stop <= start:
                 continue
 
-            new_token_id = comp.token_ids[-1]
-            state.generated_token_ids.append(new_token_id)
-            state.token_index += 1
-
             full_text = comp.text
-            prev_len = getattr(state, "_prev_text_len", 0)
-            delta = full_text[prev_len:]
+            prev_text_len = getattr(state, "_prev_text_len", 0)
+            new_text = full_text[prev_text_len:]
             state._prev_text_len = len(full_text)  # type: ignore[attr-defined]
-            state._prev_n_tokens = len(comp.token_ids)
+            state._prev_n_tokens = stop
 
-            logprobs: dict[int, float] = {}
-            if comp.logprobs and len(comp.logprobs) >= len(comp.token_ids):
-                entry = comp.logprobs[len(comp.token_ids) - 1]
-                if entry:
-                    logprobs = {tid: lp.logprob for tid, lp in entry.items()}
+            for offset, i in enumerate(range(start, stop)):
+                tid = comp.token_ids[i]
+                state.generated_token_ids.append(tid)
+                state.token_index += 1
 
-            yield TokenOutput(
-                token_id=new_token_id,
-                delta_text=delta,
-                logprobs=logprobs,
-                is_final=output.finished,
-                request_id=state.request_id,
-            )
+                logprobs: dict[int, float] = {}
+                if comp.logprobs and len(comp.logprobs) > i:
+                    entry = comp.logprobs[i]
+                    if entry:
+                        logprobs = {t: lp.logprob for t, lp in entry.items()}
+
+                is_last_in_batch = (i == stop - 1)
+                delta_text = new_text if is_last_in_batch else ""
+                is_final = output.finished and is_last_in_batch
+
+                yield TokenOutput(
+                    token_id=tid,
+                    delta_text=delta_text,
+                    logprobs=logprobs,
+                    is_final=is_final,
+                    is_last_in_batch=is_last_in_batch,
+                    request_id=state.request_id,
+                )
 
             if output.finished:
                 break

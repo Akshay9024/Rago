@@ -37,6 +37,10 @@ class IterativeRAGActor:
     def _resolve_config(profile: str) -> SystemConfig:
         if profile == "rtx4090_local":
             return SystemConfig.for_rtx4090_local()
+        elif profile == "a6000_local":
+            return SystemConfig.for_a6000_local()
+        elif profile == "a6000":
+            return SystemConfig.for_a6000_ssh(os.environ["REMOTE_HOST"])
         elif profile == "a100":
             return SystemConfig.for_a100_ssh(os.environ["REMOTE_HOST"])
         elif profile == "a100_80g":

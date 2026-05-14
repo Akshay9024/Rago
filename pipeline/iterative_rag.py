@@ -96,12 +96,15 @@ class IterativeRAGPipeline:
         passages = [r.text for r in results if r.text]
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        await self._data_plane.deliver_context(ContextPayload(
-            sequence_id=req.sequence_id,
-            retrieval_round=req.retrieval_round,
-            passages=passages,
-            retrieval_latency_ms=latency_ms,
-        ))
+        await self._data_plane.publish_context(
+            reply_subject=req.reply_subject or self._control_plane.response_subject,
+            payload=ContextPayload(
+                sequence_id=req.sequence_id,
+                retrieval_round=req.retrieval_round,
+                passages=passages,
+                retrieval_latency_ms=latency_ms,
+            ),
+        )
 
     def _build_context_token_ids(self, passages_per_round: list[list[str]]) -> list[int]:
         all_text = " ".join(p for passages in passages_per_round for p in passages)
@@ -124,7 +127,7 @@ class IterativeRAGPipeline:
         await self._scheduler.acquire(seq_id, SequencePriority.ACTIVE)
         try:
             while True:
-                prompt = self._engine.build_prompt(
+                prompt_token_ids = self._engine.build_prompt_token_ids(
                     query=request.query,
                     passages_per_round=passages_per_round,
                     completed_chunks=completed_chunks,
@@ -133,24 +136,20 @@ class IterativeRAGPipeline:
                 context_token_ids = self._build_context_token_ids(passages_per_round)
 
                 round_req_id = f"{seq_id}:{retrieval_count}"
-                spec_suppressed_until = (
-                    self._schema.spec_decoding_suppression_window
-                    if retrieval_count > 0
-                    else 0
-                )
                 seq_state = SequenceState(
                     request_id=round_req_id,
                     session_id=request.session_id,
                     trace_id=request.trace_id,
                     context_token_ids=context_token_ids,
-                    spec_suppressed_until=spec_suppressed_until,
                 )
                 seq_state._prev_text_len = 0
 
                 retrieval_triggered = False
                 accumulated_delta = ""
 
-                async for tok in self._engine.generate_tokens(prompt, seq_state):
+                async for tok in self._engine.generate_tokens(
+                    prompt_token_ids, seq_state
+                ):
                     accumulated_delta += tok.delta_text
 
                     if tok.is_final:
@@ -163,6 +162,9 @@ class IterativeRAGPipeline:
                     entropy_history.append(e)
                     if len(entropy_history) > 64:
                         entropy_history = entropy_history[-64:]
+
+                    if not tok.is_last_in_batch:
+                        continue
 
                     triggered, intrygue_state = self._intrygue.should_retrieve(
                         logprobs=tok.logprobs,
@@ -205,6 +207,7 @@ class IterativeRAGPipeline:
                     query_text=query_for_retrieval,
                     session_id=request.session_id,
                     trace_id=request.trace_id,
+                    reply_subject=self._control_plane.response_subject,
                 )
 
                 await self._control_plane.publish_retrieval_request(retrieval_req)
@@ -323,7 +326,7 @@ class IterativeRAGPipeline:
         control_plane = NATSControlPlane(config.infra)
         await control_plane.initialize()
 
-        data_plane = DataPlane(config.infra, config.deployment)
+        data_plane = DataPlane(config.infra, config.deployment, control_plane)
         await data_plane.initialize()
 
         pipeline = cls(
@@ -351,5 +354,5 @@ class IterativeRAGPipeline:
         self._subscriber_tasks.clear()
         await self._engine.shutdown()
         await self._vector_store.close()
-        await self._control_plane.close()
         await self._data_plane.close()
+        await self._control_plane.close()

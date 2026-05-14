@@ -17,7 +17,7 @@ class RAGSchema:
 
     retrieval_freq_mean: float = 3.0
     queries_per_retrieval: int = 1
-    passages_per_retrieval: int = 5
+    passages_per_retrieval: int = 2
     tokens_per_passage: int = 20
     tokens_per_injection: int = 100
 
@@ -29,8 +29,8 @@ class RAGSchema:
     chunk_size: int = 512
     chunk_overlap: int = 50
 
-    intrygue_entropy_threshold: float = 2.5
-    intrygue_copy_threshold: float = 0.3
+    intrygue_entropy_threshold: float = 1.6
+    intrygue_copy_threshold: float = 0.5
     intrygue_window: int = 8
     intrygue_ngram: int = 3
     intrygue_warmup_tokens: int = 4

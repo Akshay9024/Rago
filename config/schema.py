@@ -25,7 +25,7 @@ class RAGSchema:
     rewriter_id: Optional[str] = None
 
     prompt_length: int = 512
-    decode_length: int = 256
+    decode_length: int = 1024
     chunk_size: int = 512
     chunk_overlap: int = 50
 
